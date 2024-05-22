@@ -44,16 +44,23 @@ def process_node(node):
         node_title, intents, str(context), next_step, behavior, jump_to_node, '\n'.join(output), response_type
     )
 def process_intent(intent, dialog_nodes):
-   
-    nodes_by_intent_text = {}  
+    nodes_by_intent_text = {}
     intent_name = intent.get('intent', '')
     dialog_nodes.sort(key=lambda x: x.get('title', '') == 'No')
 
     if intent_name == "Bot_Control_Approve_Response":
-        return nodes_by_intent_text  
-    
+        return nodes_by_intent_text
+
     if intent_name == "Bot_Control_Reject_Response":
         return nodes_by_intent_text
+
+    def process_child_nodes(node, text):
+        child_nodes = [child_node for child_node in dialog_nodes if child_node.get('parent') == node.get('dialog_node')]
+        for child_node in child_nodes:
+            child_title, child_intents, child_context, child_next_step, child_behavior, child_jump_to_node, child_output, child_response_type = process_node(child_node)
+            child_output_text = child_output + str(child_context) if isinstance(child_output, str) else '\n'.join(child_output) + str(child_context)
+            nodes_by_intent_text[text].append([child_title, child_output_text, child_response_type])
+            process_child_nodes(child_node, text)
     def follow_jump_to(node, visited_nodes=None):
        
         if visited_nodes is None:
@@ -106,7 +113,7 @@ def process_intent(intent, dialog_nodes):
     examples = intent.get('examples', [])
     for example in examples:
         text = example.get('text', '')
-        nodes_by_intent_text[text] = []  
+        nodes_by_intent_text[text] = []
         for i, node in enumerate(dialog_nodes):
             node_title, intents, context, next_step, behavior, jump_to_node, output, response_type = process_node(node)
             if intent_name in intents:
@@ -119,6 +126,10 @@ def process_intent(intent, dialog_nodes):
                             follow_jump_to(jump_node)
                 else:
                     follow_jump_to(node)
+
+                # Process child nodes for any node with follow-up responses
+                process_child_nodes(node, text)
+
     return nodes_by_intent_text
 
 def write_to_excel(nodes_by_intent_text):
