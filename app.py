@@ -117,6 +117,8 @@ def process_intent(intent, dialog_nodes):
                     for jump_node in dialog_nodes:
                         if 'parent' in jump_node and jump_node['parent'] == jump_to_node:
                             follow_jump_to(jump_node)
+                else:
+                    follow_jump_to(node)
     return nodes_by_intent_text
 
 def write_to_excel(nodes_by_intent_text):
