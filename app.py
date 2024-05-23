@@ -14,23 +14,29 @@ def load_data(file):
     with open(file) as file:
         data = json.load(file)
     return data['workspace']['dialog_nodes'], data['workspace']['intents']
-
 def process_node(node):
     node_title = node.get('title', '')
     node_conditions = node.get('conditions', 'No conditions')
     context = node.get('context', {})
     next_step = node.get('next_step')
     output = []
-    response_type = None
 
     if 'output' in node and 'generic' in node['output']:
         for generic in node['output']['generic']:
             if 'values' in generic:
                 output.extend(value.get('text', '') for value in generic['values'])
-            if 'response_type' in generic:
-                response_type = generic['response_type']
 
-    output = '\n'.join(output) if len(output) > 1 else output[0] if output else ''
+    output = node.get('output', {}).get('generic', [])
+    output_text = []
+    for item in output:
+        for value in item.get('values', []):
+            text = value.get('text', '')
+            text = text.replace('\n', ' ').replace('<break time=\"500ms\"/>', ' ')  
+            text = text.replace("W IC", "WIC")
+            output_text.append(text)
+
+    output_text = ' '.join(output_text)  # Join the output_text values into a single string
+    node['output_processed'] = True
 
     behavior = None
     jump_to_node = None
@@ -41,120 +47,141 @@ def process_node(node):
 
     intents = re.findall(r"#(\w+)", node_conditions)
     return (
-        node_title, intents, str(context), next_step, behavior, jump_to_node, '\n'.join(output), response_type
+        node_title, intents, str(context), next_step, behavior, jump_to_node, output_text
     )
+def sort_dialog_nodes(dialog_nodes):
+    node_indices = {id(node): index for index, node in enumerate(dialog_nodes)}
+    dialog_nodes.sort(key=lambda x: (node_indices[id(x)], x.get('parent', ''), x.get('title', '') == 'No'))
+    return dialog_nodes
+
+def process_generic(node, nodes_by_intent_text, text):
+    title = node.get('title', '')
+    output = node.get('output', {})
+    generic = output.get('generic', [])
+    context = node.get('context', {})
+    if generic and not node.get('output_processed', False):
+        for gen in generic:
+            if gen.get('values', []):
+                output_texts = [value.get('text', '') for value in gen['values']]
+                grouped_output_text = ' '.join(output_texts)
+                if not any(grouped_output_text in sublist for sublist in nodes_by_intent_text[text]):
+                    nodes_by_intent_text[text].append([title, grouped_output_text])
+    # else:
+    #     output_text = ''
+    #     if isinstance(context, dict):
+    #         if 'send_sms' in context and context['send_sms']:
+    #             output_text = context['sms_content']
+    #     if not any(output_text in sublist for sublist in nodes_by_intent_text[text]):
+    #         nodes_by_intent_text[text].append([title, output_text])
+    return nodes_by_intent_text
+def follow_jump_to(node, dialog_nodes, nodes_by_intent_text, text, intent_text):
+    def process_and_follow_jump(current_node, jump_source_title, visited_nodes):
+        nonlocal nodes_by_intent_text
+        current_dialog_node = current_node.get('dialog_node', '')
+        if current_dialog_node in visited_nodes:
+            return
+
+        visited_nodes.add(current_dialog_node)
+
+        node_title, intents, context, next_step, behavior, jump_to_node, output = process_node(current_node)
+        if isinstance(context, dict):
+            if 'send_sms' in context and context['send_sms']:
+                output_text = context['sms_content']
+            
+        output_text = output + str(context) if isinstance(output, str) else '\n'.join(output) + str(context)
+        if not any(output_text in sublist for sublist in nodes_by_intent_text[text]):
+            nodes_by_intent_text[text].append([intent_text, output_text])
+        
+        jump_destination_title = current_node.get('title', '')
+
+        child_nodes = [child for child in dialog_nodes if child.get('parent') == current_node.get('dialog_node', '')]
+        yes_path = [child for child in child_nodes if child.get('title', '').lower() == "yes"]
+        no_path = [child for child in child_nodes if child.get('title', '').lower() == "no"]
+        anything_else = [child for child in child_nodes if child.get('title', '').lower() not in ["yes", "no"]]
+
+        for child in yes_path:
+            nodes_by_intent_text[text].append(["Choice: Yes", ""])
+            
+            if child.get('dialog_node', '') not in visited_nodes and child.get('title', '') not in ["Anything Else", "How else can I help you today?"]:
+                process_and_follow_jump(child, jump_destination_title, visited_nodes.copy())
+
+        for child in no_path:
+            nodes_by_intent_text[text].append(["Choice: No", ""])
+            if child.get('dialog_node', '') not in visited_nodes:
+                jump_to_id = child.get('next_step', {}).get('dialog_node', '')
+                if jump_to_id:  # If there's a jump_to ID
+                    jump_node = next((node for node in dialog_nodes if node.get('dialog_node', '') == jump_to_id), None)
+                    if jump_node:  # If a node with a matching dialog_node ID is found
+                        process_and_follow_jump(jump_node, jump_destination_title, visited_nodes.copy())
+                else:
+                    process_and_follow_jump(child, jump_destination_title, visited_nodes.copy())
+            else:
+                nodes_by_intent_text[text].append(["Action: No choice selected", "Expected Result: No action taken"])
+
+        for child in anything_else:
+            if child.get('dialog_node', '') not in visited_nodes and child.get('title', '') not in ["Anything Else", "How else can I help you today?"]:
+                nodes_by_intent_text[text].append([node_title])
+                process_and_follow_jump(child, jump_destination_title, visited_nodes.copy())
+
+    if node.get('title','') not in ["Anything Else", "How else can I help you today?"]:
+        process_and_follow_jump(node, "", set())
+    else:
+        return nodes_by_intent_text
 def process_intent(intent, dialog_nodes):
     nodes_by_intent_text = {}
     intent_name = intent.get('intent', '')
-    dialog_nodes.sort(key=lambda x: x.get('title', '') == 'No')
+    dialog_nodes = sort_dialog_nodes(dialog_nodes)
 
-    if intent_name == "Bot_Control_Approve_Response":
+    if intent_name in ["Bot_Control_Approve_Response", "Bot_Control_Reject_Response"]:
         return nodes_by_intent_text
 
-    if intent_name == "Bot_Control_Reject_Response":
-        return nodes_by_intent_text
-
-    def process_child_nodes(node, text):
-        child_nodes = [child_node for child_node in dialog_nodes if child_node.get('parent') == node.get('dialog_node')]
-        for child_node in child_nodes:
-            child_title, child_intents, child_context, child_next_step, child_behavior, child_jump_to_node, child_output, child_response_type = process_node(child_node)
-            child_output_text = child_output + str(child_context) if isinstance(child_output, str) else '\n'.join(child_output) + str(child_context)
-            nodes_by_intent_text[text].append([child_title, child_output_text, child_response_type])
-            process_child_nodes(child_node, text)
-    def follow_jump_to(node, visited_nodes=None):
-       
-        if visited_nodes is None:
-            visited_nodes = set()
-
-        dialog_node_id = node.get('dialog_node', '')
-        if dialog_node_id in visited_nodes or node.get('title', '') == "Anything Else":
-            return
-
-        visited_nodes.add(dialog_node_id)
-
-        title = node.get('title', '')
-        output = node.get('output', {})
-        generic = output.get('generic', [])
-        context = node.get('context', {})
-        if generic:
-            for gen in generic:
-                response_type = gen.get('response_type', '')
-              
-               
-                if gen.get('values', []):
-                    for value in gen['values']:
-                        output_text = value.get('text', '')
-                        nodes_by_intent_text[text].append([title, output_text , response_type])
-        else:
-            output_text = ''
-            if isinstance(context, dict):
-                if 'send_sms' in context and context['send_sms']:
-                    output_text += 'Send SMS: ' + str(context['send_sms'])
-                if 'sms_content' in context:
-                    output_text += ' SMS Content: ' + context['sms_content']
-            nodes_by_intent_text[text].append([title, output_text])
-
-        next_step = node.get('next_step', {}).get('dialog_node', '')
-        if next_step:
-            next_node = next((node for node in dialog_nodes if node.get('dialog_node') == next_step), None)
-            if next_node:
-                follow_jump_to(next_node, visited_nodes)
-        next_step_node = next((node for node in dialog_nodes if node.get('parent') == dialog_node_id), None)
-        if next_step_node:
-            follow_jump_to(next_step_node, visited_nodes)
-
-        if node.get('behavior', '') == 'jump_to':
-            jump_to_node = node.get('next_step', {}).get('dialog_node', '')
-            jump_node = next((node for node in dialog_nodes if node.get('parent') == jump_to_node), None)
-            if jump_node:
-                follow_jump_to(jump_node, visited_nodes)
-            
     intent_text = intent.get('text', '')
     examples = intent.get('examples', [])
     for example in examples:
         text = example.get('text', '')
-        nodes_by_intent_text[text] = []
+        nodes_by_intent_text[text] = []  
+        visited_nodes = set()  # move the definition of visited_nodes here
         for i, node in enumerate(dialog_nodes):
-            node_title, intents, context, next_step, behavior, jump_to_node, output, response_type = process_node(node)
+            node_title, intents, context, next_step, behavior, jump_to_node, output = process_node(node)
             if intent_name in intents:
-                response_type = output if intent_name == node_title else None
                 output_text = output + str(context) if isinstance(output, str) else '\n'.join(output) + str(context)
-                nodes_by_intent_text[text].append([intent_text, output_text, response_type])
+                if intent_name != node_title:  
+                    nodes_by_intent_text[text].append([intent_text, output_text])
                 if behavior == 'jump_to':
                     for jump_node in dialog_nodes:
                         if 'parent' in jump_node and jump_node['parent'] == jump_to_node:
-                            follow_jump_to(jump_node)
+                            follow_jump_to(jump_node, dialog_nodes, nodes_by_intent_text, text, intent_text)
                 else:
-                    follow_jump_to(node)
-
-                # Process child nodes for any node with follow-up responses
-                process_child_nodes(node, text)
-
+                    follow_jump_to(node, dialog_nodes, nodes_by_intent_text, text, intent_text)
     return nodes_by_intent_text
-
 def write_to_excel(nodes_by_intent_text):
     with pd.ExcelWriter('dialog_skill.xlsx') as writer:
         for index, (text, rows) in enumerate(nodes_by_intent_text.items()):
             sanitized_sheet_name = sanitize_sheet_name(str(text)[:20]) 
-            sanitized_sheet_name = f"{sanitized_sheet_name}_{index}"  
-            df = pd.DataFrame(rows, columns=['Action','Expected Result AND Instructions for Next Steps', 'Response Type'])
-            df = df.drop(columns=['Response Type'])  
-            df.insert(0, 'Step #', '') 
+            sanitized_sheet_name = f"{sanitized_sheet_name}_{index}"
+
+            df = pd.DataFrame(rows, columns=['Action','Expected Result AND Instructions for Next Steps'])
+            df.insert(0, 'Step #', '')
+  
             df.loc[-1] = ['', text, '']  
-            df.index = df.index + 1 
+            df.index = df.index + 1  
             df = df.sort_index()  
             sanitized_sheet_name = sanitized_sheet_name.strip("'")
+            
             df.to_excel(writer, sheet_name=sanitized_sheet_name, index=False)
-
 
 def clean_entry(entry):
     if entry is None:
         return None
-    cleaned_entry = entry.replace('<', '').replace('>', '').replace('Context: {}', '').replace('{', '').replace('}', '').replace('prosody rate="-25%"', '').replace("'initial_message': False", '').replace('/prosody', '').replace('break time="500ms"/', '').replace('express-as style="cheerful"', '').replace('prosody','').replace('break time="300ms"', '')
-    cleaned_entry = unicodedata.normalize('NFKD', cleaned_entry).encode('ascii', 'ignore').decode('utf-8')
+    if isinstance(entry, bool):
+        entry = str(entry)
+    entry = entry.replace('\\xa0', ' ')
+    cleaned_entry = entry.replace("<strong>", ' ').replace("</strong>", ' ').replace('<', '').replace('>', '').replace('Context: {}', '').replace('{', '').replace('}', '').replace('prosody rate="-25%"', '').replace("'initial_message': False", '').replace('/prosody', '').replace('break time="500ms"/', '').replace('express-as style="cheerful"', '').replace('prosody','').replace('break time="300ms"', '').replace('Â', ' ').replace('rate="-5%"', ' ').replace('/say-as', '').replace(' rate="-10%"', '').replace('break time="100ms"', '').replace('rate="-20%"', '').replace(' rate="-15%"', '').replace("'send_sms': True, 'sms_content': ", '').replace(' rate = "-25%"', '').replace("\n", '').replace("'ci_journey_step': 'Anything Else Help'", '')
+    cleaned_entry = ''.join(c for c in cleaned_entry if c.isprintable())
     cleaned_entry = cleaned_entry.replace('http', quote(cleaned_entry))
     cleaned_entry = re.sub(r'(\w)([A-Z])', r'\1 \2', cleaned_entry)
     return cleaned_entry
+
 def dialog_skill(file):
     dialog_nodes, intents = load_data(file)
     nodes_by_intent_text = {}
